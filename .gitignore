@@ -1,0 +1,11 @@
+build
+.built*
+.playos_*.*
+.Module.symvers*
+.env
+*.a
+*.ko
+*.o
+*.mod*
+modules.order
+Module.symvers*

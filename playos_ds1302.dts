@@ -1,0 +1,8 @@
+playos_ds1302@0 {
+    compatible = "playos,ds1302";
+    reset-gpio = <&gpio GPIOH_2 GPIO_ACTIVE_HIGH>;
+    clk-gpio = <&gpio GPIOH_3 GPIO_ACTIVE_HIGH>;
+    data-gpio = <&gpio GPIOH_4 GPIO_ACTIVE_HIGH>;
+
+    status = "okay";
+};
