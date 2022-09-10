@@ -6,6 +6,8 @@
 #include <linux/rtc.h>
 #include <linux/slab.h>
 #include <linux/printk.h>
+#include <linux/bcd.h>
+
 
 #define RTC_WRITE   0x00
 #define RTC_READ    0x01
@@ -20,6 +22,9 @@
 #define RTC_WP_ADDR        0x8E
 #define RTC_TCS_ADDR       0x90
 
+#define RTC_CLOCK_BURST 0xBE
+#define RTC_RAM_BURST   0xFE
+
 #define ds1302_delay(n) ndelay(n)
 
 
@@ -31,12 +36,14 @@ struct playos_ds1302_device {
     struct gpio_desc *ce;
     struct gpio_desc *clk;
     struct gpio_desc *data;
+
+    bool burst_mode;
 };
 
-
-static int playos_ds1302_read(struct playos_ds1302_device *dev, uint8_t addr, uint8_t *data)
+static int playos_ds1302_read_buffer(struct playos_ds1302_device *dev,
+        uint8_t addr, uint8_t *data, size_t size)
 {
-    int i;
+    int i, j;
 
     gpiod_direction_output(dev->data, 0);
     gpiod_set_value(dev->clk, 0);
@@ -55,20 +62,25 @@ static int playos_ds1302_read(struct playos_ds1302_device *dev, uint8_t addr, ui
     }
 
     gpiod_direction_input(dev->data);
-    *data = 0x00;
-    for (i = 0; i < 8; ++i) {
-        gpiod_set_value(dev->clk, 0);
-        ds1302_delay(100);
-        gpiod_set_value(dev->clk, 1);
-        *data = (*data) | (gpiod_get_value(dev->data) << i);
+    for (j = 0; j < size; ++j) {
+        data[j] = 0x00;
+        for (i = 0; i < 8; ++i) {
+            gpiod_set_value(dev->clk, 0);
+            ds1302_delay(100);
+            gpiod_set_value(dev->clk, 1);
+            data[j] = data[j] | (gpiod_get_value(dev->data) << i);
+        }
     }
+    gpiod_set_value(dev->ce, 0);
+    gpiod_set_value(dev->clk, 0);
 
     return 0;
 }
 
-static int playos_ds1302_write(struct playos_ds1302_device *dev, uint8_t addr, uint8_t data)
+static int playos_ds1302_write_buffer(struct playos_ds1302_device *dev,
+        uint8_t addr, uint8_t *buffer, size_t size)
 {
-    int i;
+    int i, j;
 
     gpiod_direction_output(dev->data, 0);
     gpiod_set_value(dev->clk, 0);
@@ -76,8 +88,6 @@ static int playos_ds1302_write(struct playos_ds1302_device *dev, uint8_t addr, u
     ds1302_delay(1000);
 
     addr = addr | RTC_WRITE;
-
-    dev_dbg("playos_ds1302_write, addr: %x, data: %x\n", addr, data);
 
     for (i = 0; i < 8; ++i) {
         gpiod_set_value(dev->data, (addr & (0x01 << i)));
@@ -88,53 +98,64 @@ static int playos_ds1302_write(struct playos_ds1302_device *dev, uint8_t addr, u
         ds1302_delay(250);
     }
 
-    for (i = 0; i < 8; ++i) {
-        gpiod_set_value(dev->data, (data & (0x01 << i)));
-        ds1302_delay(50);
-        gpiod_set_value(dev->clk, 1);
-        ds1302_delay(70);
-        gpiod_set_value(dev->clk, 0);
-        ds1302_delay(250);
+    for (j = 0; j < size; ++j) {
+        dev_dbg(&dev->pdev->dev, "playos_ds1302_write, addr: %x, data: %x\n", addr, buffer[j]);
+        for (i = 0; i < 8; ++i) {
+            gpiod_set_value(dev->data, (buffer[j] & (0x01 << i)));
+            ds1302_delay(50);
+            gpiod_set_value(dev->clk, 1);
+            ds1302_delay(70);
+            gpiod_set_value(dev->clk, 0);
+            ds1302_delay(250);
+        }
     }
+    gpiod_set_value(dev->ce, 0);
+    gpiod_set_value(dev->clk, 0);
 
     return 0;
 }
 
+static int playos_ds1302_read(struct playos_ds1302_device *dev, uint8_t addr, uint8_t *data)
+{
+    return playos_ds1302_read_buffer(dev, addr, data, 1);
+}
 
-// static int playos_ds1302_ioctl(struct device *dev, unsigned int cmd, unsigned long value)
-// {
-//     return -ENOSYS;
-// }
+static int playos_ds1302_write(struct playos_ds1302_device *dev, uint8_t addr, uint8_t data)
+{
+    return playos_ds1302_write_buffer(dev, addr, &data, 1);
+}
+
 
 static int playos_ds1302_read_time(struct device *dev, struct rtc_time *tm)
 {
     struct platform_device *pdev = to_platform_device(dev);
     struct playos_ds1302_device *pddev = platform_get_drvdata(pdev);
-    uint8_t seconds, minutes, hours, date, month, day, year;
+    uint8_t buffer[8] = { 0 };
 
-    playos_ds1302_read(pddev, RTC_SECOND_ADDR, &seconds);
-    playos_ds1302_read(pddev, RTC_MINUTE_ADDR, &minutes);
-    playos_ds1302_read(pddev, RTC_HOUR_ADDR, &hours);
-    playos_ds1302_read(pddev, RTC_DAY_ADDR, &day);
-    playos_ds1302_read(pddev, RTC_DATE_ADDR, &date);
-    playos_ds1302_read(pddev, RTC_MONTH_ADDR, &month);
-    playos_ds1302_read(pddev, RTC_YEAR_ADDR, &year);
+    if (pddev->burst_mode) {
+        playos_ds1302_read_buffer(pddev, RTC_CLOCK_BURST, buffer, sizeof(buffer));
+    } else {
+        playos_ds1302_read(pddev, RTC_SECOND_ADDR, &buffer[0]);
+        playos_ds1302_read(pddev, RTC_MINUTE_ADDR, &buffer[1]);
+        playos_ds1302_read(pddev, RTC_HOUR_ADDR, &buffer[2]);
+        playos_ds1302_read(pddev, RTC_DATE_ADDR, &buffer[3]);
+        playos_ds1302_read(pddev, RTC_MONTH_ADDR, &buffer[4]);
+        playos_ds1302_read(pddev, RTC_DAY_ADDR, &buffer[5]);
+        playos_ds1302_read(pddev, RTC_YEAR_ADDR, &buffer[6]);
+    }
 
     dev_dbg(dev, "raw data is sec=%02x, min=%02x, hr=%02x, "
-        "wday=%02x, mday=%02x, mon=%02x, year=%02x\n",
-        seconds, minutes, hours, day, date, month, year);
+        "mday=%02x, mon=%02x, wday=%02x, year=%02x\n",
+        buffer[0], buffer[1], buffer[2],
+        buffer[3], buffer[4], buffer[5], buffer[6]);
 
-    tm->tm_sec = ((seconds & 0x70) >> 4) * 10 + (seconds & 0x0F);
-    tm->tm_min = ((minutes & 0x70) >> 4) * 10 + (minutes & 0x0F);
-    if (hours & 0x80) { // 12 hour
-        tm->tm_hour = 12 * ((hours & 0x20) >> 4) + (hours & 0x1F) - 1;
-    } else {
-        tm->tm_hour = ((hours & 0x20) >> 4) * 10 + (hours & 0x1F);
-    }
-    tm->tm_wday = (day & 0x7) -1 ;
-    tm->tm_mday = ((date & 0x30) >> 4) * 10 + (date & 0x0F) - 1;
-    tm->tm_mon = ((month & 0x10) >> 4) * 10 + (month & 0x0F) - 1;
-    tm->tm_year = 2000 - 1900 + ((year & 0xF0) >> 4) * 10 + (year & 0x0F);
+    tm->tm_sec = bcd2bin(buffer[0]);
+    tm->tm_min = bcd2bin(buffer[1]);
+    tm->tm_hour = bcd2bin(buffer[2]);
+    tm->tm_mday = bcd2bin(buffer[3]);
+    tm->tm_mon = bcd2bin(buffer[4]) - 1;
+    tm->tm_wday = buffer[5] - 1;
+    tm->tm_year = bcd2bin(buffer[6]) + 100;
     
     dev_dbg(dev, "tm is secs=%d, mins=%d, hours=%d, "
         "mday=%d, mon=%d, year=%d, wday=%d\n",
@@ -148,72 +169,41 @@ static int playos_ds1302_set_time(struct device *dev, struct rtc_time *tm)
 {
     struct platform_device *pdev = to_platform_device(dev);
     struct playos_ds1302_device *pddev = platform_get_drvdata(pdev);
-    int year = 1900 - 2000 + tm->tm_year;
-    int mday = tm->tm_mday + 1;
-    int mon = tm->tm_mon + 1;
+    uint8_t buffer[8] = { 0 };
 
-    pr_err(">>>: %d\n", tm->tm_year);
-    playos_ds1302_write(pddev, RTC_SECOND_ADDR, (tm->tm_sec % 10) | ((tm->tm_sec / 10) << 4));
-    playos_ds1302_write(pddev, RTC_MINUTE_ADDR, (tm->tm_min % 10) | ((tm->tm_min / 10) << 4));
-    if (tm->tm_hour >= 20) {
-        playos_ds1302_write(pddev, RTC_HOUR_ADDR, (tm->tm_hour - 10) | 0x20);
+    if (pddev->burst_mode) {
+        buffer[0] = bin2bcd(tm->tm_sec);
+        buffer[1] = bin2bcd(tm->tm_min);
+        buffer[2] = bin2bcd(tm->tm_hour);
+        buffer[3] = bin2bcd(tm->tm_mday);
+        buffer[4] = bin2bcd(tm->tm_mon + 1);
+        buffer[5] = tm->tm_wday + 1;
+        buffer[6] = bin2bcd(tm->tm_year - 100);
+        buffer[7] = 0;
+
+        playos_ds1302_write_buffer(pddev, RTC_CLOCK_BURST, buffer, sizeof(buffer));
     } else {
-        playos_ds1302_write(pddev, RTC_HOUR_ADDR, tm->tm_hour);
+        playos_ds1302_write(pddev, RTC_SECOND_ADDR, bin2bcd(tm->tm_sec));
+        playos_ds1302_write(pddev, RTC_MINUTE_ADDR, bin2bcd(tm->tm_min));
+        playos_ds1302_write(pddev, RTC_HOUR_ADDR, bin2bcd(tm->tm_hour));
+        playos_ds1302_write(pddev, RTC_DAY_ADDR, tm->tm_wday + 1);
+        playos_ds1302_write(pddev, RTC_DATE_ADDR, bin2bcd(tm->tm_mday));
+        playos_ds1302_write(pddev, RTC_MONTH_ADDR, bin2bcd(tm->tm_mon + 1));
+        playos_ds1302_write(pddev, RTC_YEAR_ADDR, bin2bcd(tm->tm_year - 100));
     }
-    playos_ds1302_write(pddev, RTC_DAY_ADDR, tm->tm_wday + 1);
-    playos_ds1302_write(pddev, RTC_DATE_ADDR, (mday % 10) | ((mday / 10) << 4));
-    playos_ds1302_write(pddev, RTC_MONTH_ADDR, (mon % 10) | ((mon / 10) << 4));
-    playos_ds1302_write(pddev, RTC_YEAR_ADDR, (year % 10) | ((year / 10) << 4));
 
     return 0;
 }
 
-// static int playos_ds1302_read_alarm(struct device *dev, struct rtc_wkalrm *alm)
-// {
-//     return -ENOSYS;
-// }
-
-// static int playos_ds1302_set_alarm(struct device *dev, struct rtc_wkalrm *alm)
-// {
-//     return -ENOSYS;
-// }
-
-// static int playos_ds1302_proc(struct device *dev, struct seq_file *sfile)
-// {
-//     return -ENOSYS;
-// }
-
-// static int playos_ds1302_alarm_irq_enable(struct device *dev, unsigned int enabled)
-// {
-//     return -ENOSYS;
-// }
-
-// static int playos_ds1302_read_offset(struct device *dev, long *offset)
-// {
-//     return -ENOSYS;
-// }
-
-// static int playos_ds1302_set_offset(struct device *dev, long offset)
-// {
-//     return -ENOSYS;
-// }
-
-
 static const struct rtc_class_ops playos_ds1302_ops = {
-    // .ioctl = playos_ds1302_ioctl,
     .read_time = playos_ds1302_read_time,
     .set_time = playos_ds1302_set_time,
-    // .read_alarm = playos_ds1302_read_alarm,
-    // .set_alarm = playos_ds1302_set_alarm,
-    // .proc = playos_ds1302_proc,
-    // .alarm_irq_enable = playos_ds1302_alarm_irq_enable,
-    // .read_offset = playos_ds1302_read_offset,
-    // .set_offset = playos_ds1302_set_offset,
 };
 
 static int playos_ds1302_probe(struct platform_device *pdev)
 {
     int ret = 0;
+    uint8_t data = 0x00;
     struct playos_ds1302_device *ds1302 = 
             devm_kzalloc(&pdev->dev, sizeof(struct playos_ds1302_device), GFP_KERNEL);
     if (ds1302 == NULL) {
@@ -223,7 +213,9 @@ static int playos_ds1302_probe(struct platform_device *pdev)
     ds1302->pdev = pdev;
     platform_set_drvdata(pdev, ds1302);
 
-    ds1302->ce = devm_gpiod_get(&pdev->dev, "reset", GPIOD_OUT_LOW);
+    ds1302->burst_mode = of_property_read_bool(&pdev->dev.of_node[0], "burst-mode");
+    dev_info(&pdev->dev, "DS1302 burst mode: %d\n", ds1302->burst_mode);
+    ds1302->ce = devm_gpiod_get(&pdev->dev, "ce", GPIOD_OUT_LOW);
     if (IS_ERR(ds1302->ce)) {
         return PTR_ERR(ds1302->ce);
     }
@@ -249,6 +241,13 @@ static int playos_ds1302_probe(struct platform_device *pdev)
     ds1302->rtc->range_max = RTC_TIMESTAMP_END_2099;
     ds1302->rtc->start_secs = 0;
     ds1302->rtc->set_start_time = true;
+
+    playos_ds1302_read(ds1302, RTC_WP_ADDR, &data);
+    if (data & 0x80) {
+        // Enable clock write / disable write protected
+        data = 0x00;
+        playos_ds1302_write(ds1302, RTC_WP_ADDR, data);
+    }
 
     ret = devm_rtc_register_device(ds1302->rtc);
     if (ret != 0) {
