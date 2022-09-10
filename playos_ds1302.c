@@ -22,8 +22,12 @@
 #define RTC_WP_ADDR        0x8E
 #define RTC_TCS_ADDR       0x90
 
+#define RTC_RAM_START      0xC0
+
 #define RTC_CLOCK_BURST 0xBE
 #define RTC_RAM_BURST   0xFE
+
+#define RTC_RAM_SIZE 31
 
 #define ds1302_delay(n) ndelay(n)
 
@@ -40,6 +44,7 @@ struct playos_ds1302_device {
     bool burst_mode;
 };
 
+/* Only for burst read when size > 1 */
 static int playos_ds1302_read_buffer(struct playos_ds1302_device *dev,
         uint8_t addr, uint8_t *data, size_t size)
 {
@@ -77,6 +82,7 @@ static int playos_ds1302_read_buffer(struct playos_ds1302_device *dev,
     return 0;
 }
 
+/* Only for burst write when size > 1 */
 static int playos_ds1302_write_buffer(struct playos_ds1302_device *dev,
         uint8_t addr, uint8_t *buffer, size_t size)
 {
@@ -195,9 +201,55 @@ static int playos_ds1302_set_time(struct device *dev, struct rtc_time *tm)
     return 0;
 }
 
+static int playos_ds1302_nvmem_read(void *priv, unsigned int offset,
+            void *val, size_t bytes)
+{
+    struct playos_ds1302_device *dev = priv;
+    uint8_t data[RTC_RAM_SIZE] = { 0 };
+    uint8_t *value = val;
+    int i;
+
+    if (bytes < 10) {
+        for (i = 0; i < bytes; ++i) {
+            playos_ds1302_read(dev, RTC_RAM_START + (offset + i) * 2, &data[i]);
+            value[i] = data[i];
+        }
+    } else {
+        playos_ds1302_read_buffer(dev, RTC_RAM_BURST, data, sizeof(data));
+        for (i = offset; i < offset + bytes; ++i, ++value) {
+            *value = data[i];
+        }
+    }
+
+    return 0;
+}
+
+static int playos_ds1302_nvmem_write(void *priv, unsigned int offset,
+            void *val, size_t bytes)
+{
+    struct playos_ds1302_device *dev = priv;
+    uint8_t *data = val;
+    int i;
+
+    for (i = 0; i < bytes; ++i) {
+        playos_ds1302_write(dev, RTC_RAM_START + (offset + i) * 2, data[i]);
+    }
+
+    return 0;
+}
+
 static const struct rtc_class_ops playos_ds1302_ops = {
     .read_time = playos_ds1302_read_time,
     .set_time = playos_ds1302_set_time,
+};
+
+static struct nvmem_config ds1302_nvmem_cfg = {
+    .name = "ds1302-",
+    .word_size = 1,
+    .stride = 1,
+    .size = RTC_RAM_SIZE,
+    .reg_read = playos_ds1302_nvmem_read,
+    .reg_write = playos_ds1302_nvmem_write,
 };
 
 static int playos_ds1302_probe(struct platform_device *pdev)
@@ -250,6 +302,12 @@ static int playos_ds1302_probe(struct platform_device *pdev)
     }
 
     ret = devm_rtc_register_device(ds1302->rtc);
+    if (ret != 0) {
+        return ret;
+    }
+
+    ds1302_nvmem_cfg.priv = ds1302;
+    ret = devm_rtc_nvmem_register(ds1302->rtc, &ds1302_nvmem_cfg);
     if (ret != 0) {
         return ret;
     }
